@@ -1,3 +1,4 @@
+import glob
 import json
 import logging
 import os
@@ -15,9 +16,9 @@ from django.core.files import File
 from django.db import connection, models
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete
 from django.dispatch import receiver
-from django.template.defaultfilters import slugify
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.crypto import get_random_string
 from django.utils.html import strip_tags
 from imagekit.models import ProcessedImageField
 from imagekit.processors import ResizeToFit
@@ -81,6 +82,10 @@ CODECS = (
 
 ENCODE_EXTENSIONS_KEYS = [extension for extension, name in ENCODE_EXTENSIONS]
 ENCODE_RESOLUTIONS_KEYS = [resolution for resolution, name in ENCODE_RESOLUTIONS]
+
+
+def generate_uid():
+    return get_random_string(length=16)
 
 
 def original_media_file_path(instance, filename):
@@ -313,7 +318,6 @@ class Media(models.Model):
         self.__original_uploaded_poster = self.uploaded_poster
 
     def save(self, *args, **kwargs):
-
         if not self.title:
             self.title = self.media_file.path.split("/")[-1]
 
@@ -371,7 +375,6 @@ class Media(models.Model):
         # will run only when a poster is uploaded for the first time
         if self.uploaded_poster and self.uploaded_poster != self.__original_uploaded_poster:
             with open(self.uploaded_poster.path, "rb") as f:
-
                 # set this otherwise gets to infinite loop
                 self.__original_uploaded_poster = self.uploaded_poster
 
@@ -429,12 +432,16 @@ class Media(models.Model):
         Performs all related tasks, as check for media type,
         video duration, encode
         """
-
         self.set_media_type()
         if self.media_type == "video":
             self.set_thumbnail(force=True)
-            self.produce_sprite_from_video()
-            self.encode()
+            if settings.DO_NOT_TRANSCODE_VIDEO:
+                self.encoding_status = "success"
+                self.save()
+                self.produce_sprite_from_video()
+            else:
+                self.produce_sprite_from_video()
+                self.encode()
         elif self.media_type == "image":
             self.set_thumbnail(force=True)
         return True
@@ -444,7 +451,6 @@ class Media(models.Model):
         Set encoding_status as success for non video
         content since all listings filter for encoding_status success
         """
-
         kind = helpers.get_file_type(self.media_file.path)
         if kind is not None:
             if kind == "image":
@@ -452,7 +458,7 @@ class Media(models.Model):
             elif kind == "pdf":
                 self.media_type = "pdf"
 
-        if self.media_type in ["image", "pdf"]:
+        if self.media_type in ["audio", "image", "pdf"]:
             self.encoding_status = "success"
         else:
             ret = helpers.media_file_info(self.media_file.path)
@@ -470,13 +476,22 @@ class Media(models.Model):
                 self.media_type = ""
                 self.encoding_status = "fail"
 
+            audio_file_with_thumb = False
+            # handle case where a file identified as video is actually an
+            # audio file with thumbnail
             if ret.get("is_video"):
                 # case where Media is video. try to set useful
                 # metadata as duration/height
                 self.media_type = "video"
                 self.duration = int(round(float(ret.get("video_duration", 0))))
                 self.video_height = int(ret.get("video_height"))
-            elif ret.get("is_audio"):
+                if ret.get("video_info", {}).get("codec_name", {}) in ["mjpeg"]:
+                    # best guess that this is an audio file with a thumbnail
+                    # in other cases, it is not (eg it can be an AVI file)
+                    if ret.get("video_info", {}).get("avg_frame_rate", "") == '0/0':
+                        audio_file_with_thumb = True
+
+            if ret.get("is_audio") or audio_file_with_thumb:
                 self.media_type = "audio"
                 self.duration = int(float(ret.get("audio_info", {}).get("duration", 0)))
                 self.encoding_status = "success"
@@ -574,9 +589,7 @@ class Media(models.Model):
 
         # attempt to break media file in chunks
         if self.duration > settings.CHUNKIZE_VIDEO_DURATION and chunkize:
-
             for profile in profiles:
-
                 if profile.extension == "gif":
                     profiles.remove(profile)
                     encoding = Encoding(media=self, profile=profile)
@@ -664,6 +677,13 @@ class Media(models.Model):
             return ret
         for key in ENCODE_RESOLUTIONS_KEYS:
             ret[key] = {}
+
+        # if this is enabled, return original file on a way
+        # that video.js can consume
+        if settings.DO_NOT_TRANSCODE_VIDEO:
+            ret['0-original'] = {"h264": {"url": helpers.url_from_path(self.media_file.path), "status": "success", "progress": 100}}
+            return ret
+
         for encoding in self.encodings.select_related("profile").filter(chunk=False):
             if encoding.profile.extension == "gif":
                 continue
@@ -766,13 +786,45 @@ class Media(models.Model):
         return None
 
     @property
+    def slideshow_items(self):
+        slideshow_items = getattr(settings, "SLIDESHOW_ITEMS", 30)
+        if self.media_type != "image":
+            items = []
+        else:
+            qs = Media.objects.filter(listable=True, user=self.user, media_type="image").exclude(id=self.id).order_by('id')[:slideshow_items]
+
+            items = [
+                {
+                    "poster_url": item.poster_url,
+                    "url": item.get_absolute_url(),
+                    "thumbnail_url": item.thumbnail_url,
+                    "title": item.title,
+                    "original_media_url": item.original_media_url,
+                }
+                for item in qs
+            ]
+            items.insert(
+                0,
+                {
+                    "poster_url": self.poster_url,
+                    "url": self.get_absolute_url(),
+                    "thumbnail_url": self.thumbnail_url,
+                    "title": self.title,
+                    "original_media_url": self.original_media_url,
+                },
+            )
+        return items
+
+    @property
     def subtitles_info(self):
         """Property used on serializers
         Returns subtitles info
         """
 
         ret = []
-        for subtitle in self.subtitles.all():
+        # Retrieve all subtitles and sort by the first letter of their associated language's title
+        sorted_subtitles = sorted(self.subtitles.all(), key=lambda s: s.language.title[0])
+        for subtitle in sorted_subtitles:
             ret.append(
                 {
                     "src": helpers.url_from_path(subtitle.subtitle_file.path),
@@ -815,6 +867,7 @@ class Media(models.Model):
         """
 
         res = {}
+        valid_resolutions = [240, 360, 480, 720, 1080, 1440, 2160]
         if self.hls_file:
             if os.path.exists(self.hls_file):
                 hls_file = self.hls_file
@@ -826,11 +879,20 @@ class Media(models.Model):
                         uri = os.path.join(p, iframe_playlist.uri)
                         if os.path.exists(uri):
                             resolution = iframe_playlist.iframe_stream_info.resolution[1]
+                            # most probably video is vertical, getting the first value to
+                            # be the resolution
+                            if resolution not in valid_resolutions:
+                                resolution = iframe_playlist.iframe_stream_info.resolution[0]
+
                             res["{}_iframe".format(resolution)] = helpers.url_from_path(uri)
                     for playlist in m3u8_obj.playlists:
                         uri = os.path.join(p, playlist.uri)
                         if os.path.exists(uri):
                             resolution = playlist.stream_info.resolution[1]
+                            # same as above
+                            if resolution not in valid_resolutions:
+                                resolution = playlist.stream_info.resolution[0]
+
                             res["{}_playlist".format(resolution)] = helpers.url_from_path(uri)
         return res
 
@@ -900,11 +962,11 @@ class License(models.Model):
 class Category(models.Model):
     """A Category base model"""
 
-    uid = models.UUIDField(unique=True, default=uuid.uuid4)
+    uid = models.CharField(unique=True, max_length=36, default=generate_uid)
 
     add_date = models.DateTimeField(auto_now_add=True)
 
-    title = models.CharField(max_length=100, unique=True, db_index=True)
+    title = models.CharField(max_length=100, db_index=True)
 
     description = models.TextField(blank=True)
 
@@ -924,6 +986,18 @@ class Category(models.Model):
 
     listings_thumbnail = models.CharField(max_length=400, blank=True, null=True, help_text="Thumbnail to show on listings")
 
+    is_rbac_category = models.BooleanField(default=False, db_index=True, help_text='If access to Category is controlled by role based membership of Groups')
+
+    identity_provider = models.ForeignKey(
+        'socialaccount.SocialApp',
+        blank=True,
+        null=True,
+        on_delete=models.CASCADE,
+        related_name='categories',
+        help_text='If category is related with a specific Identity Provider',
+        verbose_name='IDP Config Name',
+    )
+
     def __str__(self):
         return self.title
 
@@ -937,7 +1011,11 @@ class Category(models.Model):
     def update_category_media(self):
         """Set media_count"""
 
-        self.media_count = Media.objects.filter(listable=True, category=self).count()
+        if getattr(settings, 'USE_RBAC', False) and self.is_rbac_category:
+            self.media_count = Media.objects.filter(category=self).count()
+        else:
+            self.media_count = Media.objects.filter(listable=True, category=self).count()
+
         self.save(update_fields=["media_count"])
         return True
 
@@ -998,10 +1076,8 @@ class Tag(models.Model):
         return True
 
     def save(self, *args, **kwargs):
-        self.title = slugify(self.title[:99])
-        strip_text_items = ["title"]
-        for item in strip_text_items:
-            setattr(self, item, strip_tags(getattr(self, item, None)))
+        self.title = helpers.get_alphanumeric_only(self.title)
+        self.title = self.title[:99]
         super(Tag, self).save(*args, **kwargs)
 
     @property
@@ -1155,8 +1231,35 @@ class Subtitle(models.Model):
 
     user = models.ForeignKey("users.User", on_delete=models.CASCADE)
 
+    class Meta:
+        ordering = ["language__title"]
+
     def __str__(self):
         return "{0}-{1}".format(self.media.title, self.language.title)
+
+    def get_absolute_url(self):
+        return f"{reverse('edit_subtitle')}?id={self.id}"
+
+    @property
+    def url(self):
+        return self.get_absolute_url()
+
+    def convert_to_srt(self):
+        input_path = self.subtitle_file.path
+        with tempfile.TemporaryDirectory(dir=settings.TEMP_DIRECTORY) as tmpdirname:
+            pysub = settings.PYSUBS_COMMAND
+
+            cmd = [pysub, input_path, "--to", "vtt", "-o", tmpdirname]
+            stdout = helpers.run_command(cmd)
+
+            list_of_files = os.listdir(tmpdirname)
+            if list_of_files:
+                subtitles_file = os.path.join(tmpdirname, list_of_files[0])
+                cmd = ["cp", subtitles_file, input_path]
+                stdout = helpers.run_command(cmd)  # noqa
+            else:
+                raise Exception("Could not convert to srt")
+        return True
 
 
 class RatingCategory(models.Model):
@@ -1230,7 +1333,7 @@ class Playlist(models.Model):
 
     @property
     def media_count(self):
-        return self.media.count()
+        return self.media.filter(listable=True).count()
 
     def get_absolute_url(self, api=False):
         if api:
@@ -1277,7 +1380,7 @@ class Playlist(models.Model):
 
     @property
     def thumbnail_url(self):
-        pm = self.playlistmedia_set.first()
+        pm = self.playlistmedia_set.filter(media__listable=True).first()
         if pm and pm.media.thumbnail:
             return helpers.url_from_path(pm.media.thumbnail.path)
         return None
@@ -1399,6 +1502,13 @@ def media_file_delete(sender, instance, **kwargs):
         p = os.path.dirname(instance.hls_file)
         helpers.rm_dir(p)
     instance.user.update_user_media()
+
+    # remove extra zombie thumbnails
+    if instance.thumbnail:
+        thumbnails_path = os.path.dirname(instance.thumbnail.path)
+        thumbnails = glob.glob(f'{thumbnails_path}/{instance.uid.hex}.*')
+        for thumbnail in thumbnails:
+            helpers.rm_file(thumbnail)
 
 
 @receiver(m2m_changed, sender=Media.category.through)

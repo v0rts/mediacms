@@ -3,121 +3,37 @@ import json
 import logging
 import os
 import random
-import re
-import tempfile
 import uuid
 
 import m3u8
 from django.conf import settings
 from django.contrib.postgres.indexes import GinIndex
 from django.contrib.postgres.search import SearchVectorField
-from django.core.exceptions import ValidationError
 from django.core.files import File
-from django.db import connection, models
+from django.db import models
+from django.db.models import Func, Value
 from django.db.models.signals import m2m_changed, post_delete, post_save, pre_delete
 from django.dispatch import receiver
 from django.urls import reverse
 from django.utils import timezone
-from django.utils.crypto import get_random_string
 from django.utils.html import strip_tags
 from imagekit.models import ProcessedImageField
 from imagekit.processors import ResizeToFit
-from mptt.models import MPTTModel, TreeForeignKey
 
-from . import helpers
-from .stop_words import STOP_WORDS
+from .. import helpers
+from ..stop_words import STOP_WORDS
+from .encoding import EncodeProfile, Encoding
+from .utils import (
+    ENCODE_RESOLUTIONS_KEYS,
+    MEDIA_ENCODING_STATUS,
+    MEDIA_STATES,
+    MEDIA_TYPES_SUPPORTED,
+    original_media_file_path,
+    original_thumbnail_file_path,
+)
+from .video_data import VideoTrimRequest
 
 logger = logging.getLogger(__name__)
-
-RE_TIMECODE = re.compile(r"(\d+:\d+:\d+.\d+)")
-
-# this is used by Media and Encoding models
-# reflects media encoding status for objects
-MEDIA_ENCODING_STATUS = (
-    ("pending", "Pending"),
-    ("running", "Running"),
-    ("fail", "Fail"),
-    ("success", "Success"),
-)
-
-# the media state of a Media object
-# this is set by default according to the portal workflow
-MEDIA_STATES = (
-    ("private", "Private"),
-    ("public", "Public"),
-    ("unlisted", "Unlisted"),
-)
-
-# each uploaded Media gets a media_type hint
-# by helpers.get_file_type
-
-MEDIA_TYPES_SUPPORTED = (
-    ("video", "Video"),
-    ("image", "Image"),
-    ("pdf", "Pdf"),
-    ("audio", "Audio"),
-)
-
-ENCODE_EXTENSIONS = (
-    ("mp4", "mp4"),
-    ("webm", "webm"),
-    ("gif", "gif"),
-)
-
-ENCODE_RESOLUTIONS = (
-    (2160, "2160"),
-    (1440, "1440"),
-    (1080, "1080"),
-    (720, "720"),
-    (480, "480"),
-    (360, "360"),
-    (240, "240"),
-)
-
-CODECS = (
-    ("h265", "h265"),
-    ("h264", "h264"),
-    ("vp9", "vp9"),
-)
-
-ENCODE_EXTENSIONS_KEYS = [extension for extension, name in ENCODE_EXTENSIONS]
-ENCODE_RESOLUTIONS_KEYS = [resolution for resolution, name in ENCODE_RESOLUTIONS]
-
-
-def generate_uid():
-    return get_random_string(length=16)
-
-
-def original_media_file_path(instance, filename):
-    """Helper function to place original media file"""
-    file_name = "{0}.{1}".format(instance.uid.hex, helpers.get_file_name(filename))
-    return settings.MEDIA_UPLOAD_DIR + "user/{0}/{1}".format(instance.user.username, file_name)
-
-
-def encoding_media_file_path(instance, filename):
-    """Helper function to place encoded media file"""
-
-    file_name = "{0}.{1}".format(instance.media.uid.hex, helpers.get_file_name(filename))
-    return settings.MEDIA_ENCODING_DIR + "{0}/{1}/{2}".format(instance.profile.id, instance.media.user.username, file_name)
-
-
-def original_thumbnail_file_path(instance, filename):
-    """Helper function to place original media thumbnail file"""
-
-    return settings.THUMBNAIL_UPLOAD_DIR + "user/{0}/{1}".format(instance.user.username, filename)
-
-
-def subtitles_file_path(instance, filename):
-    """Helper function to place subtitle file"""
-
-    return settings.SUBTITLES_UPLOAD_DIR + "user/{0}/{1}".format(instance.media.user.username, filename)
-
-
-def category_thumb_path(instance, filename):
-    """Helper function to place category thumbnail file"""
-
-    file_name = "{0}.{1}".format(instance.uid.hex, helpers.get_file_name(filename))
-    return settings.MEDIA_UPLOAD_DIR + "categories/{0}".format(file_name)
 
 
 class Media(models.Model):
@@ -136,7 +52,6 @@ class Media(models.Model):
         null=True,
         help_text="Media can exist in one or no Channels",
     )
-
     description = models.TextField(blank=True)
 
     dislikes = models.IntegerField(default=0)
@@ -155,7 +70,7 @@ class Media(models.Model):
         help_text="Whether media is globally featured by a MediaCMS editor",
     )
 
-    friendly_token = models.CharField(blank=True, max_length=12, db_index=True, help_text="Identifier for the Media")
+    friendly_token = models.CharField(blank=True, max_length=150, db_index=True, unique=True, help_text="Identifier for the Media")
 
     hls_file = models.CharField(max_length=1000, blank=True, help_text="Path to HLS file for videos")
 
@@ -387,7 +302,6 @@ class Media(models.Model):
         Update SearchVector field of SearchModel using raw SQL
         search field is used to store SearchVector
         """
-        db_table = self._meta.db_table
 
         # first get anything interesting out of the media
         # that needs to be search able
@@ -412,19 +326,8 @@ class Media(models.Model):
 
         text = helpers.clean_query(text)
 
-        sql_code = """
-            UPDATE {db_table} SET search = to_tsvector(
-                '{config}', '{text}'
-            ) WHERE {db_table}.id = {id}
-            """.format(
-            db_table=db_table, config="simple", text=text, id=self.id
-        )
+        Media.objects.filter(id=self.id).update(search=Func(Value('simple'), Value(text), function='to_tsvector'))
 
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(sql_code)
-        except BaseException:
-            pass  # TODO:add log
         return True
 
     def media_init(self):
@@ -524,8 +427,12 @@ class Media(models.Model):
                 with open(self.media_file.path, "rb") as f:
                     myfile = File(f)
                     thumbnail_name = helpers.get_file_name(self.media_file.path) + ".jpg"
-                    self.thumbnail.save(content=myfile, name=thumbnail_name)
-                    self.poster.save(content=myfile, name=thumbnail_name)
+                    # avoid saving the whole object, because something might have been changed
+                    # on the meanwhile
+                    self.thumbnail.save(content=myfile, name=thumbnail_name, save=False)
+                    self.poster.save(content=myfile, name=thumbnail_name, save=False)
+                    self.save(update_fields=["thumbnail", "poster"])
+
         return True
 
     def produce_thumbnails_from_video(self):
@@ -559,8 +466,11 @@ class Media(models.Model):
             with open(tf, "rb") as f:
                 myfile = File(f)
                 thumbnail_name = helpers.get_file_name(self.media_file.path) + ".jpg"
-                self.thumbnail.save(content=myfile, name=thumbnail_name)
-                self.poster.save(content=myfile, name=thumbnail_name)
+                # avoid saving the whole object, because something might have been changed
+                # on the meanwhile
+                self.thumbnail.save(content=myfile, name=thumbnail_name, save=False)
+                self.poster.save(content=myfile, name=thumbnail_name, save=False)
+                self.save(update_fields=["thumbnail", "poster"])
         helpers.rm_file(tf)
         return True
 
@@ -569,7 +479,7 @@ class Media(models.Model):
         To be used on the video player
         """
 
-        from . import tasks
+        from .. import tasks
 
         tasks.produce_sprite_from_video.delay(self.friendly_token)
         return True
@@ -585,7 +495,7 @@ class Media(models.Model):
             profiles = EncodeProfile.objects.filter(active=True)
         profiles = list(profiles)
 
-        from . import tasks
+        from .. import tasks
 
         # attempt to break media file in chunks
         if self.duration > settings.CHUNKIZE_VIDEO_DURATION and chunkize:
@@ -637,15 +547,20 @@ class Media(models.Model):
                     self.preview_file_path = ""
                 else:
                     self.preview_file_path = encoding.media_file.path
-                self.save(update_fields=["listable", "preview_file_path"])
 
-        self.save(update_fields=["encoding_status", "listable"])
+        self.save(update_fields=["encoding_status", "listable", "preview_file_path"])
 
-        if encoding and encoding.status == "success" and encoding.profile.codec == "h264" and action == "add":
-            from . import tasks
+        if encoding and encoding.status == "success" and encoding.profile.codec == "h264" and action == "add" and not encoding.chunk:
+            from .. import tasks
 
-            tasks.create_hls(self.friendly_token)
+            tasks.create_hls.delay(self.friendly_token)
 
+            # TODO: ideally would ensure this is run only at the end when the last encoding is done...
+            vt_request = VideoTrimRequest.objects.filter(media=self, status="running").first()
+            if vt_request:
+                tasks.post_trim_action.delay(self.friendly_token)
+                vt_request.status = "success"
+                vt_request.save(update_fields=["status"])
         return True
 
     def set_encoding_status(self):
@@ -668,6 +583,29 @@ class Media(models.Model):
         return True
 
     @property
+    def trim_video_url(self):
+        if self.media_type not in ["video"]:
+            return None
+
+        ret = self.encodings.filter(status="success", profile__extension='mp4', chunk=False).order_by("-profile__resolution").first()
+        if ret:
+            return helpers.url_from_path(ret.media_file.path)
+
+        # showing the original file
+        return helpers.url_from_path(self.media_file.path)
+
+    @property
+    def trim_video_path(self):
+        if self.media_type not in ["video"]:
+            return None
+
+        ret = self.encodings.filter(status="success", profile__extension='mp4', chunk=False).order_by("-profile__resolution").first()
+        if ret:
+            return ret.media_file.path
+
+        return None
+
+    @property
     def encodings_info(self, full=False):
         """Property used on serializers"""
 
@@ -678,9 +616,14 @@ class Media(models.Model):
         for key in ENCODE_RESOLUTIONS_KEYS:
             ret[key] = {}
 
-        # if this is enabled, return original file on a way
-        # that video.js can consume
+        # if DO_NOT_TRANSCODE_VIDEO enabled, return original file on a way
+        # that video.js can consume. Or also if encoding_status is running, do the
+        # same so that the video appears on the player
         if settings.DO_NOT_TRANSCODE_VIDEO:
+            ret['0-original'] = {"h264": {"url": helpers.url_from_path(self.media_file.path), "status": "success", "progress": 100}}
+            return ret
+
+        if self.encoding_status in ["running", "pending"]:
             ret['0-original'] = {"h264": {"url": helpers.url_from_path(self.media_file.path), "status": "success", "progress": 100}}
             return ret
 
@@ -867,7 +810,7 @@ class Media(models.Model):
         """
 
         res = {}
-        valid_resolutions = [240, 360, 480, 720, 1080, 1440, 2160]
+        valid_resolutions = [144, 240, 360, 480, 720, 1080, 1440, 2160]
         if self.hls_file:
             if os.path.exists(self.hls_file):
                 hls_file = self.hls_file
@@ -884,7 +827,7 @@ class Media(models.Model):
                             if resolution not in valid_resolutions:
                                 resolution = iframe_playlist.iframe_stream_info.resolution[0]
 
-                            res["{}_iframe".format(resolution)] = helpers.url_from_path(uri)
+                            res[f"{resolution}_iframe"] = helpers.url_from_path(uri)
                     for playlist in m3u8_obj.playlists:
                         uri = os.path.join(p, playlist.uri)
                         if os.path.exists(uri):
@@ -893,7 +836,8 @@ class Media(models.Model):
                             if resolution not in valid_resolutions:
                                 resolution = playlist.stream_info.resolution[0]
 
-                            res["{}_playlist".format(resolution)] = helpers.url_from_path(uri)
+                            res[f"{resolution}_playlist"] = helpers.url_from_path(uri)
+
         return res
 
     @property
@@ -912,11 +856,11 @@ class Media(models.Model):
 
     def get_absolute_url(self, api=False, edit=False):
         if edit:
-            return reverse("edit_media") + "?m={0}".format(self.friendly_token)
+            return f"{reverse('edit_media')}?m={self.friendly_token}"
         if api:
             return reverse("api_get_media", kwargs={"friendly_token": self.friendly_token})
         else:
-            return reverse("get_media") + "?m={0}".format(self.friendly_token)
+            return f"{reverse('get_media')}?m={self.friendly_token}"
 
     @property
     def edit_url(self):
@@ -924,7 +868,7 @@ class Media(models.Model):
 
     @property
     def add_subtitle_url(self):
-        return "/add_subtitle?m=%s" % self.friendly_token
+        return f"/add_subtitle?m={self.friendly_token}"
 
     @property
     def ratings_info(self):
@@ -948,496 +892,40 @@ class Media(models.Model):
             )
         return ret
 
+    @property
+    def video_chapters_folder(self):
+        custom_folder = f"{settings.THUMBNAIL_UPLOAD_DIR}{self.user.username}/{self.friendly_token}_chapters"
+        return os.path.join(settings.MEDIA_ROOT, custom_folder)
 
-class License(models.Model):
-    """A Base license model to be used in Media"""
+    @property
+    def chapter_data(self):
+        data = []
+        chapter_data = self.chapters.first()
+        if chapter_data:
+            return chapter_data.chapter_data
+        return data
 
-    title = models.CharField(max_length=100, unique=True)
-    description = models.TextField(blank=True)
 
-    def __str__(self):
-        return self.title
+class MediaPermission(models.Model):
+    """Model to store user permissions for media"""
 
-
-class Category(models.Model):
-    """A Category base model"""
-
-    uid = models.CharField(unique=True, max_length=36, default=generate_uid)
-
-    add_date = models.DateTimeField(auto_now_add=True)
-
-    title = models.CharField(max_length=100, db_index=True)
-
-    description = models.TextField(blank=True)
-
-    user = models.ForeignKey("users.User", on_delete=models.CASCADE, blank=True, null=True)
-
-    is_global = models.BooleanField(default=False, help_text="global categories or user specific")
-
-    media_count = models.IntegerField(default=0, help_text="number of media")
-
-    thumbnail = ProcessedImageField(
-        upload_to=category_thumb_path,
-        processors=[ResizeToFit(width=344, height=None)],
-        format="JPEG",
-        options={"quality": 85},
-        blank=True,
+    PERMISSION_CHOICES = (
+        ("viewer", "Viewer"),
+        ("editor", "Editor"),
+        ("owner", "Owner"),
     )
 
-    listings_thumbnail = models.CharField(max_length=400, blank=True, null=True, help_text="Thumbnail to show on listings")
-
-    is_rbac_category = models.BooleanField(default=False, db_index=True, help_text='If access to Category is controlled by role based membership of Groups')
-
-    identity_provider = models.ForeignKey(
-        'socialaccount.SocialApp',
-        blank=True,
-        null=True,
-        on_delete=models.CASCADE,
-        related_name='categories',
-        help_text='If category is related with a specific Identity Provider',
-        verbose_name='IDP Config Name',
-    )
-
-    def __str__(self):
-        return self.title
+    owner_user = models.ForeignKey('users.User', on_delete=models.CASCADE, related_name='granted_permissions')
+    user = models.ForeignKey('users.User', on_delete=models.CASCADE)
+    media = models.ForeignKey('Media', on_delete=models.CASCADE, related_name='permissions')
+    permission = models.CharField(max_length=20, choices=PERMISSION_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ["title"]
-        verbose_name_plural = "Categories"
-
-    def get_absolute_url(self):
-        return reverse("search") + "?c={0}".format(self.title)
-
-    def update_category_media(self):
-        """Set media_count"""
-
-        if getattr(settings, 'USE_RBAC', False) and self.is_rbac_category:
-            self.media_count = Media.objects.filter(category=self).count()
-        else:
-            self.media_count = Media.objects.filter(listable=True, category=self).count()
-
-        self.save(update_fields=["media_count"])
-        return True
-
-    @property
-    def thumbnail_url(self):
-        """Return thumbnail for category
-        prioritize processed value of listings_thumbnail
-        then thumbnail
-        """
-
-        if self.listings_thumbnail:
-            return self.listings_thumbnail
-        if self.thumbnail:
-            return helpers.url_from_path(self.thumbnail.path)
-
-        media = Media.objects.filter(category=self, state="public").order_by("-views").first()
-        if media:
-            return media.thumbnail_url
-
-        return None
-
-    def save(self, *args, **kwargs):
-        strip_text_items = ["title", "description"]
-        for item in strip_text_items:
-            setattr(self, item, strip_tags(getattr(self, item, None)))
-        super(Category, self).save(*args, **kwargs)
-
-
-class Tag(models.Model):
-    """A Tag model"""
-
-    title = models.CharField(max_length=100, unique=True, db_index=True)
-
-    user = models.ForeignKey("users.User", on_delete=models.CASCADE, blank=True, null=True)
-
-    media_count = models.IntegerField(default=0, help_text="number of media")
-
-    listings_thumbnail = models.CharField(
-        max_length=400,
-        blank=True,
-        null=True,
-        help_text="Thumbnail to show on listings",
-        db_index=True,
-    )
+        unique_together = ('user', 'media')
 
     def __str__(self):
-        return self.title
-
-    class Meta:
-        ordering = ["title"]
-
-    def get_absolute_url(self):
-        return reverse("search") + "?t={0}".format(self.title)
-
-    def update_tag_media(self):
-        self.media_count = Media.objects.filter(state="public", is_reviewed=True, tags=self).count()
-        self.save(update_fields=["media_count"])
-        return True
-
-    def save(self, *args, **kwargs):
-        self.title = helpers.get_alphanumeric_only(self.title)
-        self.title = self.title[:99]
-        super(Tag, self).save(*args, **kwargs)
-
-    @property
-    def thumbnail_url(self):
-        if self.listings_thumbnail:
-            return self.listings_thumbnail
-        media = Media.objects.filter(tags=self, state="public").order_by("-views").first()
-        if media:
-            return media.thumbnail_url
-
-        return None
-
-
-class EncodeProfile(models.Model):
-    """Encode Profile model
-    keeps information for each profile
-    """
-
-    name = models.CharField(max_length=90)
-
-    extension = models.CharField(max_length=10, choices=ENCODE_EXTENSIONS)
-
-    resolution = models.IntegerField(choices=ENCODE_RESOLUTIONS, blank=True, null=True)
-
-    codec = models.CharField(max_length=10, choices=CODECS, blank=True, null=True)
-
-    description = models.TextField(blank=True, help_text="description")
-
-    active = models.BooleanField(default=True)
-
-    def __str__(self):
-        return self.name
-
-    class Meta:
-        ordering = ["resolution"]
-
-
-class Encoding(models.Model):
-    """Encoding Media Instances"""
-
-    add_date = models.DateTimeField(auto_now_add=True)
-
-    commands = models.TextField(blank=True, help_text="commands run")
-
-    chunk = models.BooleanField(default=False, db_index=True, help_text="is chunk?")
-
-    chunk_file_path = models.CharField(max_length=400, blank=True)
-
-    chunks_info = models.TextField(blank=True)
-
-    logs = models.TextField(blank=True)
-
-    md5sum = models.CharField(max_length=50, blank=True, null=True)
-
-    media = models.ForeignKey(Media, on_delete=models.CASCADE, related_name="encodings")
-
-    media_file = models.FileField("encoding file", upload_to=encoding_media_file_path, blank=True, max_length=500)
-
-    profile = models.ForeignKey(EncodeProfile, on_delete=models.CASCADE)
-
-    progress = models.PositiveSmallIntegerField(default=0)
-
-    update_date = models.DateTimeField(auto_now=True)
-
-    retries = models.IntegerField(default=0)
-
-    size = models.CharField(max_length=20, blank=True)
-
-    status = models.CharField(max_length=20, choices=MEDIA_ENCODING_STATUS, default="pending")
-
-    temp_file = models.CharField(max_length=400, blank=True)
-
-    task_id = models.CharField(max_length=100, blank=True)
-
-    total_run_time = models.IntegerField(default=0)
-
-    worker = models.CharField(max_length=100, blank=True)
-
-    @property
-    def media_encoding_url(self):
-        if self.media_file:
-            return helpers.url_from_path(self.media_file.path)
-        return None
-
-    @property
-    def media_chunk_url(self):
-        if self.chunk_file_path:
-            return helpers.url_from_path(self.chunk_file_path)
-        return None
-
-    def save(self, *args, **kwargs):
-        if self.media_file:
-            cmd = ["stat", "-c", "%s", self.media_file.path]
-            stdout = helpers.run_command(cmd).get("out")
-            if stdout:
-                size = int(stdout.strip())
-                self.size = helpers.show_file_size(size)
-        if self.chunk_file_path and not self.md5sum:
-            cmd = ["md5sum", self.chunk_file_path]
-            stdout = helpers.run_command(cmd).get("out")
-            if stdout:
-                md5sum = stdout.strip().split()[0]
-                self.md5sum = md5sum
-
-        super(Encoding, self).save(*args, **kwargs)
-
-    def set_progress(self, progress, commit=True):
-        if isinstance(progress, int):
-            if 0 <= progress <= 100:
-                self.progress = progress
-                self.save(update_fields=["progress"])
-                return True
-        return False
-
-    def __str__(self):
-        return "{0}-{1}".format(self.profile.name, self.media.title)
-
-    def get_absolute_url(self):
-        return reverse("api_get_encoding", kwargs={"encoding_id": self.id})
-
-
-class Language(models.Model):
-    """Language model
-    to be used with Subtitles
-    """
-
-    code = models.CharField(max_length=12, help_text="language code")
-
-    title = models.CharField(max_length=100, help_text="language code")
-
-    class Meta:
-        ordering = ["id"]
-
-    def __str__(self):
-        return "{0}-{1}".format(self.code, self.title)
-
-
-class Subtitle(models.Model):
-    """Subtitles model"""
-
-    language = models.ForeignKey(Language, on_delete=models.CASCADE)
-
-    media = models.ForeignKey(Media, on_delete=models.CASCADE, related_name="subtitles")
-
-    subtitle_file = models.FileField(
-        "Subtitle/CC file",
-        help_text="File has to be WebVTT format",
-        upload_to=subtitles_file_path,
-        max_length=500,
-    )
-
-    user = models.ForeignKey("users.User", on_delete=models.CASCADE)
-
-    class Meta:
-        ordering = ["language__title"]
-
-    def __str__(self):
-        return "{0}-{1}".format(self.media.title, self.language.title)
-
-    def get_absolute_url(self):
-        return f"{reverse('edit_subtitle')}?id={self.id}"
-
-    @property
-    def url(self):
-        return self.get_absolute_url()
-
-    def convert_to_srt(self):
-        input_path = self.subtitle_file.path
-        with tempfile.TemporaryDirectory(dir=settings.TEMP_DIRECTORY) as tmpdirname:
-            pysub = settings.PYSUBS_COMMAND
-
-            cmd = [pysub, input_path, "--to", "vtt", "-o", tmpdirname]
-            stdout = helpers.run_command(cmd)
-
-            list_of_files = os.listdir(tmpdirname)
-            if list_of_files:
-                subtitles_file = os.path.join(tmpdirname, list_of_files[0])
-                cmd = ["cp", subtitles_file, input_path]
-                stdout = helpers.run_command(cmd)  # noqa
-            else:
-                raise Exception("Could not convert to srt")
-        return True
-
-
-class RatingCategory(models.Model):
-    """Rating Category
-    Facilitate user ratings.
-    One or more rating categories per Category can exist
-    will be shown to the media if they are enabled
-    """
-
-    description = models.TextField(blank=True)
-
-    enabled = models.BooleanField(default=True)
-
-    title = models.CharField(max_length=200, unique=True, db_index=True)
-
-    class Meta:
-        verbose_name_plural = "Rating Categories"
-
-    def __str__(self):
-        return "{0}".format(self.title)
-
-
-def validate_rating(value):
-    if -1 >= value or value > 5:
-        raise ValidationError("score has to be between 0 and 5")
-
-
-class Rating(models.Model):
-    """User Rating"""
-
-    add_date = models.DateTimeField(auto_now_add=True)
-
-    media = models.ForeignKey(Media, on_delete=models.CASCADE, related_name="ratings")
-
-    rating_category = models.ForeignKey(RatingCategory, on_delete=models.CASCADE)
-
-    score = models.IntegerField(validators=[validate_rating])
-
-    user = models.ForeignKey("users.User", on_delete=models.CASCADE)
-
-    class Meta:
-        verbose_name_plural = "Ratings"
-        indexes = [
-            models.Index(fields=["user", "media"]),
-        ]
-        unique_together = ("user", "media", "rating_category")
-
-    def __str__(self):
-        return "{0}, rate for {1} for category {2}".format(self.user.username, self.media.title, self.rating_category.title)
-
-
-class Playlist(models.Model):
-    """Playlists model"""
-
-    add_date = models.DateTimeField(auto_now_add=True, db_index=True)
-
-    description = models.TextField(blank=True, help_text="description")
-
-    friendly_token = models.CharField(blank=True, max_length=12, db_index=True)
-
-    media = models.ManyToManyField(Media, through="playlistmedia", blank=True)
-
-    title = models.CharField(max_length=100, db_index=True)
-
-    uid = models.UUIDField(unique=True, default=uuid.uuid4)
-
-    user = models.ForeignKey("users.User", on_delete=models.CASCADE, db_index=True, related_name="playlists")
-
-    def __str__(self):
-        return self.title
-
-    @property
-    def media_count(self):
-        return self.media.filter(listable=True).count()
-
-    def get_absolute_url(self, api=False):
-        if api:
-            return reverse("api_get_playlist", kwargs={"friendly_token": self.friendly_token})
-        else:
-            return reverse("get_playlist", kwargs={"friendly_token": self.friendly_token})
-
-    @property
-    def url(self):
-        return self.get_absolute_url()
-
-    @property
-    def api_url(self):
-        return self.get_absolute_url(api=True)
-
-    def user_thumbnail_url(self):
-        if self.user.logo:
-            return helpers.url_from_path(self.user.logo.path)
-        return None
-
-    def set_ordering(self, media, ordering):
-        if media not in self.media.all():
-            return False
-        pm = PlaylistMedia.objects.filter(playlist=self, media=media).first()
-        if pm and isinstance(ordering, int) and 0 < ordering:
-            pm.ordering = ordering
-            pm.save()
-            return True
-        return False
-
-    def save(self, *args, **kwargs):
-        strip_text_items = ["title", "description"]
-        for item in strip_text_items:
-            setattr(self, item, strip_tags(getattr(self, item, None)))
-        self.title = self.title[:99]
-
-        if not self.friendly_token:
-            while True:
-                friendly_token = helpers.produce_friendly_token()
-                if not Playlist.objects.filter(friendly_token=friendly_token):
-                    self.friendly_token = friendly_token
-                    break
-        super(Playlist, self).save(*args, **kwargs)
-
-    @property
-    def thumbnail_url(self):
-        pm = self.playlistmedia_set.filter(media__listable=True).first()
-        if pm and pm.media.thumbnail:
-            return helpers.url_from_path(pm.media.thumbnail.path)
-        return None
-
-
-class PlaylistMedia(models.Model):
-    """Helper model to store playlist specific media"""
-
-    action_date = models.DateTimeField(auto_now=True)
-
-    media = models.ForeignKey(Media, on_delete=models.CASCADE)
-
-    playlist = models.ForeignKey(Playlist, on_delete=models.CASCADE)
-
-    ordering = models.IntegerField(default=1)
-
-    class Meta:
-        ordering = ["ordering", "-action_date"]
-
-
-class Comment(MPTTModel):
-    """Comments model"""
-
-    add_date = models.DateTimeField(auto_now_add=True)
-
-    media = models.ForeignKey(Media, on_delete=models.CASCADE, db_index=True, related_name="comments")
-
-    parent = TreeForeignKey("self", on_delete=models.CASCADE, null=True, blank=True, related_name="children")
-
-    text = models.TextField(help_text="text")
-
-    uid = models.UUIDField(unique=True, default=uuid.uuid4)
-
-    user = models.ForeignKey("users.User", on_delete=models.CASCADE, db_index=True)
-
-    class MPTTMeta:
-        order_insertion_by = ["add_date"]
-
-    def __str__(self):
-        return "On {0} by {1}".format(self.media.title, self.user.username)
-
-    def save(self, *args, **kwargs):
-        strip_text_items = ["text"]
-        for item in strip_text_items:
-            setattr(self, item, strip_tags(getattr(self, item, None)))
-
-        if self.text:
-            self.text = self.text[: settings.MAX_CHARS_FOR_COMMENT]
-
-        super(Comment, self).save(*args, **kwargs)
-
-    def get_absolute_url(self):
-        return reverse("get_media") + "?m={0}".format(self.media.friendly_token)
-
-    @property
-    def media_url(self):
-        return self.get_absolute_url()
+        return f"{self.user.username} - {self.media.title} ({self.permission})"
 
 
 @receiver(post_save, sender=Media)
@@ -1447,8 +935,11 @@ def media_save(sender, instance, created, **kwargs):
     # once model is saved
     # SOS: do not put anything here, as if more logic is added,
     # we have to disconnect signal to avoid infinite recursion
+    if not instance.friendly_token:
+        return False
+
     if created:
-        from .methods import notify_users
+        from ..methods import notify_users
 
         instance.media_init()
         notify_users(friendly_token=instance.friendly_token, action="media_added")
@@ -1485,7 +976,6 @@ def media_file_delete(sender, instance, **kwargs):
     Deletes file from filesystem
     when corresponding `Media` object is deleted.
     """
-
     if instance.media_file:
         helpers.rm_file(instance.media_file.path)
     if instance.thumbnail:
@@ -1501,6 +991,7 @@ def media_file_delete(sender, instance, **kwargs):
     if instance.hls_file:
         p = os.path.dirname(instance.hls_file)
         helpers.rm_dir(p)
+
     instance.user.update_user_media()
 
     # remove extra zombie thumbnails
@@ -1519,169 +1010,3 @@ def media_m2m(sender, instance, **kwargs):
     if instance.tags.all():
         for tag in instance.tags.all():
             tag.update_tag_media()
-
-
-@receiver(post_save, sender=Encoding)
-def encoding_file_save(sender, instance, created, **kwargs):
-    """Performs actions on encoding file delete
-    For example, if encoding is a chunk file, with encoding_status success,
-    perform a check if this is the final chunk file of a media, then
-    concatenate chunks, create final encoding file and delete chunks
-    """
-
-    if instance.chunk and instance.status == "success":
-        # a chunk got completed
-
-        # check if all chunks are OK
-        # then concatenate to new Encoding - and remove chunks
-        # this should run only once!
-        if instance.media_file:
-            try:
-                orig_chunks = json.loads(instance.chunks_info).keys()
-            except BaseException:
-                instance.delete()
-                return False
-
-            chunks = Encoding.objects.filter(
-                media=instance.media,
-                profile=instance.profile,
-                chunks_info=instance.chunks_info,
-                chunk=True,
-            ).order_by("add_date")
-
-            complete = True
-
-            # perform validation, make sure everything is there
-            for chunk in orig_chunks:
-                if not chunks.filter(chunk_file_path=chunk):
-                    complete = False
-                    break
-
-            for chunk in chunks:
-                if not (chunk.media_file and chunk.media_file.path):
-                    complete = False
-                    break
-
-            if complete:
-                # concatenate chunks and create final encoding file
-                chunks_paths = [f.media_file.path for f in chunks]
-
-                with tempfile.TemporaryDirectory(dir=settings.TEMP_DIRECTORY) as temp_dir:
-                    seg_file = helpers.create_temp_file(suffix=".txt", dir=temp_dir)
-                    tf = helpers.create_temp_file(suffix=".{0}".format(instance.profile.extension), dir=temp_dir)
-                    with open(seg_file, "w") as ff:
-                        for f in chunks_paths:
-                            ff.write("file {}\n".format(f))
-                    cmd = [
-                        settings.FFMPEG_COMMAND,
-                        "-y",
-                        "-f",
-                        "concat",
-                        "-safe",
-                        "0",
-                        "-i",
-                        seg_file,
-                        "-c",
-                        "copy",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-movflags",
-                        "faststart",
-                        tf,
-                    ]
-                    stdout = helpers.run_command(cmd)
-
-                    encoding = Encoding(
-                        media=instance.media,
-                        profile=instance.profile,
-                        status="success",
-                        progress=100,
-                    )
-                    all_logs = "\n".join([st.logs for st in chunks])
-                    encoding.logs = "{0}\n{1}\n{2}".format(chunks_paths, stdout, all_logs)
-                    workers = list(set([st.worker for st in chunks]))
-                    encoding.worker = json.dumps({"workers": workers})
-
-                    start_date = min([st.add_date for st in chunks])
-                    end_date = max([st.update_date for st in chunks])
-                    encoding.total_run_time = (end_date - start_date).seconds
-                    encoding.save()
-
-                    with open(tf, "rb") as f:
-                        myfile = File(f)
-                        output_name = "{0}.{1}".format(
-                            helpers.get_file_name(instance.media.media_file.path),
-                            instance.profile.extension,
-                        )
-                        encoding.media_file.save(content=myfile, name=output_name)
-
-                    # encoding is saved, deleting chunks
-                    # and any other encoding that might exist
-                    # first perform one last validation
-                    # to avoid that this is run twice
-                    if (
-                        len(orig_chunks)
-                        == Encoding.objects.filter(  # noqa
-                            media=instance.media,
-                            profile=instance.profile,
-                            chunks_info=instance.chunks_info,
-                        ).count()
-                    ):
-                        # if two chunks are finished at the same time, this
-                        # will be changed
-                        who = Encoding.objects.filter(media=encoding.media, profile=encoding.profile).exclude(id=encoding.id)
-                        who.delete()
-                    else:
-                        encoding.delete()
-                    if not Encoding.objects.filter(chunks_info=instance.chunks_info):
-                        # TODO: in case of remote workers, files should be deleted
-                        # example
-                        # for worker in workers:
-                        #    for chunk in json.loads(instance.chunks_info).keys():
-                        #        remove_media_file.delay(media_file=chunk)
-                        for chunk in json.loads(instance.chunks_info).keys():
-                            helpers.rm_file(chunk)
-                    instance.media.post_encode_actions(encoding=instance, action="add")
-
-    elif instance.chunk and instance.status == "fail":
-        encoding = Encoding(media=instance.media, profile=instance.profile, status="fail", progress=100)
-
-        chunks = Encoding.objects.filter(media=instance.media, chunks_info=instance.chunks_info, chunk=True).order_by("add_date")
-
-        chunks_paths = [f.media_file.path for f in chunks]
-
-        all_logs = "\n".join([st.logs for st in chunks])
-        encoding.logs = "{0}\n{1}".format(chunks_paths, all_logs)
-        workers = list(set([st.worker for st in chunks]))
-        encoding.worker = json.dumps({"workers": workers})
-        start_date = min([st.add_date for st in chunks])
-        end_date = max([st.update_date for st in chunks])
-        encoding.total_run_time = (end_date - start_date).seconds
-        encoding.save()
-
-        who = Encoding.objects.filter(media=encoding.media, profile=encoding.profile).exclude(id=encoding.id)
-
-        who.delete()
-        # TODO: merge with above if, do not repeat code
-    else:
-        if instance.status in ["fail", "success"]:
-            instance.media.post_encode_actions(encoding=instance, action="add")
-
-        encodings = set([encoding.status for encoding in Encoding.objects.filter(media=instance.media)])
-        if ("running" in encodings) or ("pending" in encodings):
-            return
-
-
-@receiver(post_delete, sender=Encoding)
-def encoding_file_delete(sender, instance, **kwargs):
-    """
-    Deletes file from filesystem
-    when corresponding `Encoding` object is deleted.
-    """
-
-    if instance.media_file:
-        helpers.rm_file(instance.media_file.path)
-        if not instance.chunk:
-            instance.media.post_encode_actions(encoding=instance, action="delete")
-    # delete local chunks, and remote chunks + media file. Only when the
-    # last encoding of a media is complete
